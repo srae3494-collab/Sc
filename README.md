@@ -12,8 +12,11 @@ A client-side visual utility for Roblox experiences that you own or are authoriz
 
 ### Crosshair Studio
 - Toggle the crosshair on or off.
-- Five selectable layouts: Neon Vortex, Cyber X, Precision, Orbital, and Rainbow Star.
-- Animated multi-color RGB arms.
+- Six selectable layouts: Neon Vortex, Cyber X, Precision, Tactical, Orbital, and Rainbow Star.
+- Six color themes (Neon, Rainbow, Toxic, Fire, Ice, Royal) with a smooth, continuous color flow.
+- Neon-tube look: colored body, white core, soft glow halo, and a thin dark outline for contrast on any background.
+- Spinning gradient ring (arcs), orbiting dots, and a rotating star, plus a subtle breathing ring.
+- Click bloom: the crosshair briefly expands and settles back (visual only).
 - Optional center dot and outer ring.
 - Adjustable size, gap, thickness, glow level, and opacity.
 

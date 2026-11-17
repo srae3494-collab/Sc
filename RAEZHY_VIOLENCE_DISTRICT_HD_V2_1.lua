@@ -221,19 +221,61 @@ end
 local defaults = {
     crosshairEnabled = true,
     crosshairMode = "NEON VORTEX",
-    rgbEnabled = true,
+    colorTheme = "NEON",
+    rgbEnabled = true,      -- smooth color flow
+    spinEnabled = true,     -- ring arcs / orbit dots / star rotation
+    pulseEnabled = true,    -- bloom animation on click
     ringEnabled = true,
     dotEnabled = true,
     crosshairSize = 18,
     crosshairGap = 6,
     crosshairThickness = 3,
-    glowLevel = 2,
+    glowLevel = 3,
     opacity = 0,
     graphicsPreset = "MEDIUM",
 }
 local config = table.clone(defaults)
 local savedSessionConfig = nil
 local hue = 0
+local pulse = 0
+local clock = 0
+
+local function rgb(r, g, b) return Color3.fromRGB(r, g, b) end
+local function round(value) return math.floor(value + 0.5) end
+
+-- Color themes (cyclic palettes, sampled smoothly).
+local PALETTES = {
+    NEON = {rgb(55, 230, 255), rgb(177, 100, 255), rgb(255, 75, 170), rgb(177, 100, 255)},
+    RAINBOW = {rgb(255, 70, 90), rgb(255, 200, 60), rgb(90, 255, 150), rgb(60, 200, 255), rgb(150, 100, 255), rgb(255, 80, 200)},
+    TOXIC = {rgb(90, 255, 120), rgb(210, 255, 80), rgb(40, 220, 190)},
+    FIRE = {rgb(255, 60, 60), rgb(255, 140, 40), rgb(255, 225, 90), rgb(255, 140, 40)},
+    ICE = {rgb(255, 255, 255), rgb(160, 215, 255), rgb(90, 160, 255), rgb(160, 215, 255)},
+    ROYAL = {rgb(173, 75, 255), rgb(224, 190, 255), rgb(120, 60, 220), rgb(224, 190, 255)},
+}
+local THEME_ORDER = {"NEON", "RAINBOW", "TOXIC", "FIRE", "ICE", "ROYAL"}
+
+-- Crosshair models. Multipliers are applied on top of the Size / Gap / Thickness settings.
+local MODES = {
+    ["NEON VORTEX"] = {cardinal = true, arcs = true, ringSpin = 110},
+    ["CYBER X"] = {diagonal = true, ringSpin = 70},
+    ["PRECISION"] = {cardinal = true, size = 0.62, gap = 0.65, thick = -1},
+    ["TACTICAL"] = {cardinal = true, hideTop = true, size = 0.9},
+    ["ORBITAL"] = {cardinal = true, size = 0.72, gap = 1.15, orbit = true},
+    ["RAINBOW STAR"] = {cardinal = true, diagonal = true, size = 0.82, spin = 24, ringSpin = -60, theme = "RAINBOW"},
+}
+local MODE_ORDER = {"NEON VORTEX", "CYBER X", "PRECISION", "TACTICAL", "ORBITAL", "RAINBOW STAR"}
+local activeMode = MODES["NEON VORTEX"]
+
+-- Glow strength per level: padding around each part and transparency of the halo.
+local GLOW_LEVELS = {
+    {pad = 1, alpha = 0.88, ring = 1.5},
+    {pad = 2, alpha = 0.80, ring = 2},
+    {pad = 3, alpha = 0.70, ring = 2.5},
+    {pad = 5, alpha = 0.58, ring = 3},
+}
+
+local ARM_NAMES = {"top", "topRight", "right", "bottomRight", "bottom", "bottomLeft", "left", "topLeft"}
+local ARM_PHASE = {top = 0, topRight = 0.1, right = 0.2, bottomRight = 0.3, bottom = 0.4, bottomLeft = 0.5, left = 0.6, topLeft = 0.7}
 
 local cross = make("Frame", {
     Name = "Crosshair",
@@ -244,147 +286,286 @@ local cross = make("Frame", {
     Visible = true,
     ZIndex = 20,
 }, gui)
+local bloom = make("UIScale", {Scale = 1}, cross)
 
-local crosshairParts = {}
-local function createPart(name, isDiagonal)
+-- Everything that can rotate as one star lives in the spinner.
+local spinner = make("Frame", {
+    Name = "Spinner",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(1, 1),
+    BackgroundTransparency = 1,
+    ZIndex = 22,
+}, cross)
+
+-- A part = soft glow halo (sibling behind) + colored body + white neon core + thin dark outline.
+local function createPart(name, isDot)
+    local glow = make("Frame", {
+        Name = name .. "Glow",
+        BorderSizePixel = 0,
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 0.7,
+        ZIndex = 21,
+    }, spinner)
+    make("UICorner", {CornerRadius = UDim.new(0.5, 0)}, glow)
+
     local item = make("Frame", {
         Name = name,
         BorderSizePixel = 0,
         BackgroundColor3 = Color3.new(1, 1, 1),
         BackgroundTransparency = config.opacity,
-        Visible = true,
         ZIndex = 22,
-    }, cross)
-    addCorner(item, 3)
-    local outline = addStroke(item, Color3.new(1, 1, 1), 2, 0.08)
-    table.insert(crosshairParts, {frame = item, outline = outline, diagonal = isDiagonal})
-    return item
+    }, spinner)
+    make("UICorner", {CornerRadius = UDim.new(0.5, 0)}, item)
+    local outline = addStroke(item, Color3.new(0, 0, 0), 1, 0.4)
+
+    local core = nil
+    if not isDot then
+        core = make("Frame", {
+            Name = "Core",
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            BorderSizePixel = 0,
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BackgroundTransparency = 0.05,
+            ZIndex = 23,
+        }, item)
+        make("UICorner", {CornerRadius = UDim.new(0.5, 0)}, core)
+    end
+
+    return {frame = item, glow = glow, core = core, outline = outline}
 end
 
-local arms = {
-    top = createPart("TopArm", false),
-    right = createPart("RightArm", false),
-    bottom = createPart("BottomArm", false),
-    left = createPart("LeftArm", false),
-    topRight = createPart("TopRightArm", true),
-    bottomRight = createPart("BottomRightArm", true),
-    bottomLeft = createPart("BottomLeftArm", true),
-    topLeft = createPart("TopLeftArm", true),
-}
-local centerDot = createPart("CenterDot", false)
-local outerRing = make("Frame", {
-    Name = "OuterRing",
+local arms = {}
+for _, name in ipairs(ARM_NAMES) do
+    arms[name] = createPart(name, false)
+end
+local centerDot = createPart("CenterDot", true)
+
+-- Outer ring: a gradient stroke (color + optional gaps) that spins, with a wider faint copy as glow.
+local ringLayers = {}
+local function createRing(name, zIndex)
+    local frame = make("Frame", {
+        Name = name,
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromOffset(0, 0),
+        Size = UDim2.fromOffset(60, 60),
+        BackgroundTransparency = 1,
+        ZIndex = zIndex,
+    }, cross)
+    make("UICorner", {CornerRadius = UDim.new(0.5, 0)}, frame)
+    local stroke = addStroke(frame, Color3.new(1, 1, 1), 2, 0.05)
+    local gradient = make("UIGradient", {}, stroke)
+    local scale = make("UIScale", {Scale = 1}, frame)
+    local layer = {frame = frame, stroke = stroke, gradient = gradient, scale = scale}
+    table.insert(ringLayers, layer)
+    return layer
+end
+local ringGlow = createRing("OuterRingGlow", 20)
+local ring = createRing("OuterRing", 21)
+
+-- Orbit dots (ORBITAL model) ride on the ring.
+local orbit = make("Frame", {
+    Name = "Orbit",
     AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.fromOffset(0, 0),
-    Size = UDim2.fromOffset(42, 42),
+    Size = UDim2.fromOffset(60, 60),
     BackgroundTransparency = 1,
-    ZIndex = 21,
+    Visible = false,
+    ZIndex = 23,
 }, cross)
-addCorner(outerRing, 100)
-local ringStroke = addStroke(outerRing, Color3.new(1, 1, 1), 2, 0.05)
+local orbitDots = {}
+for i = 0, 2 do
+    local spoke = make("Frame", {
+        Name = "Spoke",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(1, 1),
+        Rotation = i * 120,
+        BackgroundTransparency = 1,
+        ZIndex = 23,
+    }, orbit)
+    local dot = make("Frame", {
+        Name = "OrbitDot",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0),
+        Size = UDim2.fromOffset(6, 6),
+        BorderSizePixel = 0,
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        ZIndex = 24,
+    }, spoke)
+    make("UICorner", {CornerRadius = UDim.new(0.5, 0)}, dot)
+    addStroke(dot, Color3.new(0, 0, 0), 1, 0.4)
+    table.insert(orbitDots, dot)
+end
 
-local function positionArm(item, x, y, width, height, rotation)
-    item.Size = UDim2.fromOffset(width, height)
-    item.Position = UDim2.fromOffset(x, y)
-    item.Rotation = rotation or 0
+local SOLID_ALPHA = NumberSequence.new(0)
+local ARC_ALPHA = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1),
+    NumberSequenceKeypoint.new(0.02, 0),
+    NumberSequenceKeypoint.new(0.28, 0),
+    NumberSequenceKeypoint.new(0.30, 1),
+    NumberSequenceKeypoint.new(0.52, 1),
+    NumberSequenceKeypoint.new(0.54, 0),
+    NumberSequenceKeypoint.new(0.80, 0),
+    NumberSequenceKeypoint.new(0.82, 1),
+    NumberSequenceKeypoint.new(1, 1),
+})
+
+local function samplePalette(palette, t)
+    local count = #palette
+    local position = (t % 1) * count
+    local index = math.floor(position)
+    local fraction = position - index
+    local a = palette[index % count + 1]
+    local b = palette[(index + 1) % count + 1]
+    return a:Lerp(b, fraction)
+end
+
+local function buildSequence(palette)
+    local count = #palette
+    local keys = {}
+    for i = 0, count do
+        keys[#keys + 1] = ColorSequenceKeypoint.new(i / count, palette[i % count + 1])
+    end
+    return ColorSequence.new(keys)
+end
+
+local function currentPalette()
+    local themeName = activeMode.theme or config.colorTheme
+    return PALETTES[themeName] or PALETTES.NEON
+end
+
+local gradientPalette = nil
+local function applyCrosshairColors()
+    local palette = currentPalette()
+    if palette ~= gradientPalette then
+        gradientPalette = palette
+        local sequence = buildSequence(palette)
+        for _, layer in ipairs(ringLayers) do
+            layer.gradient.Color = sequence
+        end
+    end
+
+    for _, name in ipairs(ARM_NAMES) do
+        local color = samplePalette(palette, hue + ARM_PHASE[name])
+        arms[name].frame.BackgroundColor3 = color
+        arms[name].glow.BackgroundColor3 = color
+    end
+
+    centerDot.frame.BackgroundColor3 = Color3.new(1, 1, 1)
+    centerDot.glow.BackgroundColor3 = samplePalette(palette, hue + 0.5)
+
+    for index, dot in ipairs(orbitDots) do
+        dot.BackgroundColor3 = samplePalette(palette, hue + index / 3)
+    end
+end
+
+local function placePart(entry, cx, cy, width, height, rotation, horizontal, pad)
+    local x = round(cx - width / 2)
+    local y = round(cy - height / 2)
+    entry.frame.Size = UDim2.fromOffset(width, height)
+    entry.frame.Position = UDim2.fromOffset(x, y)
+    entry.frame.Rotation = rotation
+    entry.glow.Size = UDim2.fromOffset(width + pad * 2, height + pad * 2)
+    entry.glow.Position = UDim2.fromOffset(x - pad, y - pad)
+    entry.glow.Rotation = rotation
+    if entry.core then
+        local coreThickness = math.max(1, math.floor(math.min(width, height) / 2))
+        if horizontal then
+            entry.core.Size = UDim2.new(1, -2, 0, coreThickness)
+        else
+            entry.core.Size = UDim2.new(0, coreThickness, 1, -2)
+        end
+    end
+end
+
+local function setPartVisible(entry, visible, glowOn)
+    entry.frame.Visible = visible
+    entry.glow.Visible = visible and glowOn
 end
 
 local function updateCrosshair()
     cross.Visible = config.crosshairEnabled
     if not config.crosshairEnabled then return end
 
-    local size = config.crosshairSize
-    local gap = config.crosshairGap
-    local thickness = config.crosshairThickness
-    local mode = config.crosshairMode
+    local mode = MODES[config.crosshairMode] or MODES["NEON VORTEX"]
+    activeMode = mode
 
-    local cardinalVisible = true
-    local diagonalVisible = false
-    if mode == "CYBER X" then
-        cardinalVisible = false
-        diagonalVisible = true
-    elseif mode == "PRECISION" then
-        size = math.max(7, math.floor(size * 0.62))
-        gap = math.max(2, math.floor(gap * 0.65))
-        thickness = math.max(2, thickness - 1)
-    elseif mode == "ORBITAL" then
-        size = math.floor(size * 0.72)
-        gap = math.floor(gap * 1.15)
-    elseif mode == "RAINBOW STAR" then
-        diagonalVisible = true
-        size = math.floor(size * 0.82)
-    end
+    local size = math.max(4, math.floor(config.crosshairSize * (mode.size or 1)))
+    local gap = math.max(1, math.floor(config.crosshairGap * (mode.gap or 1)))
+    local thickness = math.max(1, config.crosshairThickness + (mode.thick or 0))
+    local glowStyle = GLOW_LEVELS[config.glowLevel] or GLOW_LEVELS[3]
+    local pad = glowStyle.pad
+    local glowAlpha = glowStyle.alpha + (1 - glowStyle.alpha) * config.opacity
 
-    positionArm(arms.top, -thickness / 2, -gap - size, thickness, size, 0)
-    positionArm(arms.bottom, -thickness / 2, gap, thickness, size, 0)
-    positionArm(arms.left, -gap - size, -thickness / 2, size, thickness, 0)
-    positionArm(arms.right, gap, -thickness / 2, size, thickness, 0)
+    -- Cardinal arms.
+    local half = size / 2
+    placePart(arms.top, 0, -(gap + half), thickness, size, 0, false, pad)
+    placePart(arms.bottom, 0, gap + half, thickness, size, 0, false, pad)
+    placePart(arms.left, -(gap + half), 0, size, thickness, 0, true, pad)
+    placePart(arms.right, gap + half, 0, size, thickness, 0, true, pad)
 
+    -- Diagonal arms: centered on the 45 degree lines, rotated to point at the center.
     local diagonalSize = math.max(7, math.floor(size * 0.72))
-    local diagonalOffset = gap + math.floor(diagonalSize * 0.55)
-    positionArm(arms.topRight, diagonalOffset - thickness / 2, -diagonalOffset - thickness / 2, thickness, diagonalSize, -45)
-    positionArm(arms.bottomRight, diagonalOffset - thickness / 2, diagonalOffset - diagonalSize / 2, thickness, diagonalSize, 45)
-    positionArm(arms.bottomLeft, -diagonalOffset - thickness / 2, diagonalOffset - diagonalSize / 2, thickness, diagonalSize, -45)
-    positionArm(arms.topLeft, -diagonalOffset - thickness / 2, -diagonalOffset - diagonalSize / 2, thickness, diagonalSize, 45)
+    local diagonalCenter = (gap + diagonalSize / 2 + 1) * 0.7071
+    placePart(arms.topRight, diagonalCenter, -diagonalCenter, thickness, diagonalSize, 45, false, pad)
+    placePart(arms.bottomLeft, -diagonalCenter, diagonalCenter, thickness, diagonalSize, 45, false, pad)
+    placePart(arms.bottomRight, diagonalCenter, diagonalCenter, thickness, diagonalSize, -45, false, pad)
+    placePart(arms.topLeft, -diagonalCenter, -diagonalCenter, thickness, diagonalSize, -45, false, pad)
 
-    for _, item in pairs({arms.top, arms.right, arms.bottom, arms.left}) do
-        item.Visible = cardinalVisible
-    end
-    for _, item in pairs({arms.topRight, arms.bottomRight, arms.bottomLeft, arms.topLeft}) do
-        item.Visible = diagonalVisible
-    end
+    local cardinalVisible = mode.cardinal == true
+    local diagonalVisible = mode.diagonal == true
+    local glowOn = glowAlpha < 0.99
+    setPartVisible(arms.top, cardinalVisible and not mode.hideTop, glowOn)
+    setPartVisible(arms.right, cardinalVisible, glowOn)
+    setPartVisible(arms.bottom, cardinalVisible, glowOn)
+    setPartVisible(arms.left, cardinalVisible, glowOn)
+    setPartVisible(arms.topRight, diagonalVisible, glowOn)
+    setPartVisible(arms.bottomRight, diagonalVisible, glowOn)
+    setPartVisible(arms.bottomLeft, diagonalVisible, glowOn)
+    setPartVisible(arms.topLeft, diagonalVisible, glowOn)
 
-    centerDot.Size = UDim2.fromOffset(config.dotEnabled and 4 or 0, config.dotEnabled and 4 or 0)
-    centerDot.Position = UDim2.fromOffset(-2, -2)
-    centerDot.Visible = config.dotEnabled
-    centerDot.BackgroundTransparency = config.opacity
-    outerRing.Visible = config.ringEnabled
-    local ringSize = size + gap * 2 + 16
-    outerRing.Size = UDim2.fromOffset(ringSize, ringSize)
+    -- Center dot.
+    placePart(centerDot, 0, 0, 4, 4, 0, false, pad)
+    setPartVisible(centerDot, config.dotEnabled, glowOn)
 
-    local glowThickness = ({1, 2, 3, 4})[config.glowLevel] or 2
-    for _, entry in ipairs(crosshairParts) do
+    -- Transparency (opacity setting applies to bodies, cores and halos).
+    for _, entry in pairs(arms) do
         entry.frame.BackgroundTransparency = config.opacity
-        entry.outline.Thickness = glowThickness
-        entry.outline.Transparency = 0.08 + (config.glowLevel == 1 and 0.28 or 0)
+        entry.outline.Transparency = 0.4 + 0.6 * config.opacity
+        entry.glow.BackgroundTransparency = glowAlpha
+        if entry.core then entry.core.BackgroundTransparency = 0.05 + 0.95 * config.opacity end
     end
-    ringStroke.Thickness = glowThickness
-end
+    centerDot.frame.BackgroundTransparency = config.opacity
+    centerDot.outline.Transparency = 0.4 + 0.6 * config.opacity
+    centerDot.glow.BackgroundTransparency = glowAlpha
 
-local rainbowColors = {
-    Color3.fromRGB(55, 230, 255), -- cyan
-    Color3.fromRGB(255, 75, 170), -- pink
-    Color3.fromRGB(125, 255, 175), -- mint
-    Color3.fromRGB(177, 100, 255), -- purple
-    Color3.fromRGB(255, 220, 90), -- yellow
-    Color3.fromRGB(90, 150, 255), -- blue
-    Color3.fromRGB(255, 125, 90), -- coral
-    Color3.fromRGB(255, 255, 255), -- white
-}
-
-local function applyCrosshairColors()
-    if config.rgbEnabled then
-        local shift = math.floor(hue * #rainbowColors)
-        local names = {"top", "right", "bottom", "left", "topRight", "bottomRight", "bottomLeft", "topLeft"}
-        for index, name in ipairs(names) do
-            local color = rainbowColors[((index + shift - 1) % #rainbowColors) + 1]
-            local frame = arms[name]
-            frame.BackgroundColor3 = color
-            local outline = frame:FindFirstChildOfClass("UIStroke")
-            if outline then outline.Color = color end
-        end
-        centerDot.BackgroundColor3 = Color3.new(1, 1, 1)
-        local dotOutline = centerDot:FindFirstChildOfClass("UIStroke")
-        if dotOutline then dotOutline.Color = Color3.new(1, 1, 1) end
-        ringStroke.Color = Color3.fromHSV((hue + 0.08) % 1, 0.75, 1)
-    else
-        local fixed = Color3.fromRGB(224, 190, 255)
-        for _, entry in ipairs(crosshairParts) do
-            entry.frame.BackgroundColor3 = fixed
-            entry.outline.Color = fixed
-        end
-        ringStroke.Color = fixed
+    -- Ring sits just outside the longest arm tip.
+    local tip = 0
+    if cardinalVisible then tip = gap + size end
+    if diagonalVisible then tip = math.max(tip, gap + diagonalSize + 1) end
+    local ringSize = (tip + 8) * 2
+    local alphaSequence = mode.arcs and ARC_ALPHA or SOLID_ALPHA
+    for _, layer in ipairs({ringGlow, ring}) do
+        layer.frame.Size = UDim2.fromOffset(ringSize, ringSize)
+        layer.frame.Visible = config.ringEnabled
+        layer.gradient.Transparency = alphaSequence
     end
+    ring.stroke.Thickness = glowStyle.ring
+    ring.stroke.Transparency = 0.05 + 0.9 * config.opacity
+    ringGlow.stroke.Thickness = glowStyle.ring + pad + 1
+    ringGlow.stroke.Transparency = math.min(1, glowAlpha + 0.12)
+    ringGlow.frame.Visible = config.ringEnabled and glowOn
+
+    orbit.Size = UDim2.fromOffset(ringSize, ringSize)
+    orbit.Visible = config.ringEnabled and mode.orbit == true
+
+    if not config.spinEnabled or (mode.spin or 0) == 0 then
+        spinner.Rotation = 0
+    end
+
+    applyCrosshairColors()
 end
 
 -- Lighting snapshot and owned post-processing effects.
@@ -494,17 +675,39 @@ button("Crosshair: ON / OFF", function()
     updateCrosshair()
     setStatus("Crosshair " .. (config.crosshairEnabled and "enabled" or "disabled"))
 end)
-button("Model: NEON VORTEX  •  Cycle", function()
-    local modes = {"NEON VORTEX", "CYBER X", "PRECISION", "ORBITAL", "RAINBOW STAR"}
-    local index = table.find(modes, config.crosshairMode) or 1
-    config.crosshairMode = modes[index % #modes + 1]
+local modelButton, themeButton
+local function refreshLabels()
+    modelButton.Text = "Model: " .. config.crosshairMode .. "  •  Cycle"
+    themeButton.Text = "Color Theme: " .. config.colorTheme .. "  •  Cycle"
+end
+modelButton = button("", function()
+    local index = table.find(MODE_ORDER, config.crosshairMode) or 1
+    config.crosshairMode = MODE_ORDER[index % #MODE_ORDER + 1]
+    refreshLabels()
     updateCrosshair()
     setStatus("Crosshair model: " .. config.crosshairMode)
 end)
-button("RGB Mix Animation: ON / OFF", function()
+themeButton = button("", function()
+    local index = table.find(THEME_ORDER, config.colorTheme) or 1
+    config.colorTheme = THEME_ORDER[index % #THEME_ORDER + 1]
+    refreshLabels()
+    applyCrosshairColors()
+    setStatus("Color theme: " .. config.colorTheme)
+end)
+refreshLabels()
+button("Color Flow Animation: ON / OFF", function()
     config.rgbEnabled = not config.rgbEnabled
     applyCrosshairColors()
-    setStatus("RGB animation " .. (config.rgbEnabled and "enabled" or "disabled"))
+    setStatus("Color flow " .. (config.rgbEnabled and "enabled" or "disabled"))
+end)
+button("Spin / Orbit Animation: ON / OFF", function()
+    config.spinEnabled = not config.spinEnabled
+    updateCrosshair()
+    setStatus("Spin animation " .. (config.spinEnabled and "enabled" or "disabled"))
+end)
+button("Click Bloom Pulse: ON / OFF", function()
+    config.pulseEnabled = not config.pulseEnabled
+    setStatus("Click pulse " .. (config.pulseEnabled and "enabled" or "disabled"))
 end)
 button("Outer Ring: ON / OFF", function()
     config.ringEnabled = not config.ringEnabled
@@ -561,14 +764,15 @@ button("Load Saved Settings", function()
         return
     end
     config = table.clone(savedSessionConfig)
+    refreshLabels()
     updateCrosshair()
     applyGraphicsPreset(config.graphicsPreset or "MEDIUM")
     setStatus("Saved session settings loaded")
 end)
 button("Reset All Settings", function()
     config = table.clone(defaults)
+    refreshLabels()
     updateCrosshair()
-    applyCrosshairColors()
     applyGraphicsPreset(config.graphicsPreset)
     setStatus("Settings reset to defaults")
 end)
@@ -586,16 +790,51 @@ minimize.Activated:Connect(function()
     minimize.Text = minimized and "+" or "—"
 end)
 
--- Render loop: per-arm rainbow colors rotate smoothly without changing gameplay.
-local renderConnection = RunService.RenderStepped:Connect(function(deltaTime)
-    if config.rgbEnabled then
-        hue = (hue + deltaTime * 0.18) % 1
-        applyCrosshairColors()
+-- Click bloom: the crosshair briefly expands and settles back (purely visual).
+dragConnections[#dragConnections + 1] = UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or not config.pulseEnabled then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        pulse = 1
     end
 end)
 
+-- Render loop: smooth color flow, spinning ring arcs / orbit dots / star, breathing ring, click bloom.
+local renderConnection = RunService.RenderStepped:Connect(function(deltaTime)
+    if not config.crosshairEnabled then return end
+    clock += deltaTime
+
+    if config.rgbEnabled then
+        hue = (hue + deltaTime * 0.12) % 1
+        applyCrosshairColors()
+    end
+
+    if config.spinEnabled then
+        local spinSpeed = activeMode.spin or 0
+        if spinSpeed ~= 0 then
+            spinner.Rotation = (spinner.Rotation + spinSpeed * deltaTime) % 360
+        end
+        local ringSpeed = activeMode.ringSpin or 0
+        if ringSpeed ~= 0 then
+            for _, layer in ipairs(ringLayers) do
+                layer.gradient.Rotation = (layer.gradient.Rotation + ringSpeed * deltaTime) % 360
+            end
+        end
+        if orbit.Visible then
+            orbit.Rotation = (orbit.Rotation + 150 * deltaTime) % 360
+        end
+        local breathe = 1 + 0.025 * math.sin(clock * 2.4)
+        for _, layer in ipairs(ringLayers) do
+            layer.scale.Scale = breathe
+        end
+    end
+
+    if pulse > 0 then
+        pulse = math.max(0, pulse - deltaTime * 4.5)
+    end
+    bloom.Scale = 1 + 0.22 * pulse * pulse
+end)
+
 updateCrosshair()
-applyCrosshairColors()
 
 local cleaned = false
 local function cleanup()
